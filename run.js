@@ -1,4 +1,25 @@
 const { chromium } = require('playwright');
+const readline = require('readline/promises');
+
+/** Prompt the operator on the terminal for the SMS verification code. */
+async function promptForSmsCode({ phoneNumber, inboxUrl } = {}) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+  console.log('\n============================================================');
+  console.log('SMS verification required to finish account creation.');
+  if (phoneNumber) console.log(`Number used: ${phoneNumber}`);
+  if (inboxUrl)    console.log(`Inbox URL:   ${inboxUrl}`);
+  console.log('Check the SMS inbox for the code and enter it below.');
+  console.log('============================================================');
+  try {
+    while (true) {
+      const answer = (await rl.question('Enter the SMS code: ')).trim();
+      if (answer) return answer;
+      console.log('Code cannot be empty, please try again.');
+    }
+  } finally {
+    rl.close();
+  }
+}
 
 (async () => {
   const browser = await chromium.launch({ headless: true });
@@ -118,13 +139,64 @@ const { chromium } = require('playwright');
     await page.locator('[id$="-postalCode"]').nth(1).fill(zip, { force: true });
 
     await page.locator('button#registration-submit').click({ force: true });
-    console.log('Form submitted. Waiting for confirmation...');
+    console.log('Form submitted. Waiting for SMS verification step...');
+
+    await handleSmsVerification();
+  }
+
+  /** Wait for the SMS verification screen, prompt the operator for the code,
+   *  fill it in, and submit. Falls back gracefully if the flow skips SMS. */
+  async function handleSmsVerification() {
+    const codeInputSelector = [
+      '#verification-code',
+      '#registration-verification-code',
+      '#sms-code',
+      '#smsCode',
+      '[name="verificationCode"]',
+      '[name="smsCode"]',
+      '[id*="verification" i][id*="code" i]',
+      '[id*="sms" i][id*="code" i]',
+      'input[autocomplete="one-time-code"]',
+    ].join(', ');
+
+    const successSelector = '[class*="success"], [class*="welcome"], [class*="confirmation"], #lobby';
+
+    let codeInput;
+    try {
+      codeInput = await Promise.race([
+        page.waitForSelector(codeInputSelector, { timeout: 30000 }).then(el => ({ kind: 'code', el })),
+        page.waitForSelector(successSelector,   { timeout: 30000 }).then(el => ({ kind: 'done', el })),
+      ]);
+    } catch (e) {
+      console.log('No SMS verification prompt detected within 30s – capturing state.');
+      await page.screenshot({ path: 'post_submit_state.png' });
+      return;
+    }
+
+    if (codeInput.kind === 'done') {
+      console.log('✓ Account created successfully (no SMS step shown).');
+      return;
+    }
+
+    const code = await promptForSmsCode({ phoneNumber: tempPhoneNumber, inboxUrl: smsInboxUrl });
+    console.log(`Submitting SMS code: ${code}`);
+
+    await codeInput.el.fill(code);
+
+    const submitCandidates = page.locator(
+      'button#verify-sms, button#verification-submit, button[type="submit"]:has-text("Verify"), button:has-text("Verify"), button:has-text("Submit")'
+    );
+    if (await submitCandidates.count() > 0) {
+      await submitCandidates.first().click({ force: true }).catch(() => {});
+    } else {
+      await codeInput.el.press('Enter').catch(() => {});
+    }
 
     try {
-      await page.waitForSelector('[class*="success"], [class*="welcome"], [class*="confirmation"], #lobby', { timeout: 20000 });
-      console.log('✓ Account created successfully!');
+      await page.waitForSelector(successSelector, { timeout: 20000 });
+      console.log('✓ Account verified and created successfully!');
     } catch (e) {
-      console.log('Success indicator not found, checking final state...');
+      console.log('Verification confirmation not detected, capturing final state.');
       await page.screenshot({ path: 'final_state.png' });
     }
   }
